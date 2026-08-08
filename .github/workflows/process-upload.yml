@@ -1,0 +1,88 @@
+name: Process Upload
+
+# Manually triggerable via the Actions tab, or dispatched programmatically
+# by the main backend's services/githubActions.js. Kept in its own repo so
+# the main/frontend/backend repos stay free of CI-heavy tooling.
+on:
+  workflow_dispatch:
+    inputs:
+      film_id:
+        description: "MongoDB _id of the film to process"
+        required: true
+      master_key:
+        description: "R2 object key of the uploaded master video"
+        required: true
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+
+    steps:
+      - name: Verify ffmpeg is available
+        run: |
+          ffmpeg -version
+          ffprobe -version
+
+      - name: Configure AWS CLI for R2
+        run: |
+          aws configure set aws_access_key_id "${{ secrets.R2_ACCESS_KEY_ID }}"
+          aws configure set aws_secret_access_key "${{ secrets.R2_SECRET_ACCESS_KEY }}"
+          aws configure set default.region auto
+
+      - name: Download master file from R2
+        env:
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+        run: |
+          aws s3 cp "s3://${{ secrets.R2_BUCKET }}/${{ github.event.inputs.master_key }}" \
+            ./master.mp4 --endpoint-url "$R2_ENDPOINT"
+
+      - name: Probe video (duration + height)
+        id: probe
+        run: |
+          HEIGHT=$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of csv=p=0 master.mp4)
+          DURATION=$(ffprobe -v error -show_entries format=duration -of csv=p=0 master.mp4)
+          echo "height=$HEIGHT" >> "$GITHUB_OUTPUT"
+          echo "duration=$DURATION" >> "$GITHUB_OUTPUT"
+
+      - name: Generate thumbnail
+        run: ffmpeg -y -ss 5 -i master.mp4 -vframes 1 thumb.jpg
+
+      - name: Generate 30s preview
+        run: ffmpeg -y -i master.mp4 -t 30 -vf scale=480:-1 preview.mp4
+
+      - name: Upload results to R2
+        id: upload
+        env:
+          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+          MASTER_KEY: ${{ github.event.inputs.master_key }}
+        run: |
+          # Derive sibling keys from the master's key, stripping its extension,
+          # so thumbnail/preview sit next to the master in the bucket.
+          BASE="${MASTER_KEY%.*}"
+          THUMB_KEY="${BASE}-thumb.jpg"
+          PREVIEW_KEY="${BASE}-preview.mp4"
+
+          aws s3 cp thumb.jpg "s3://${{ secrets.R2_BUCKET }}/${THUMB_KEY}" \
+            --endpoint-url "$R2_ENDPOINT" --content-type image/jpeg
+          aws s3 cp preview.mp4 "s3://${{ secrets.R2_BUCKET }}/${PREVIEW_KEY}" \
+            --endpoint-url "$R2_ENDPOINT" --content-type video/mp4
+
+          echo "thumb_key=${THUMB_KEY}" >> "$GITHUB_OUTPUT"
+          echo "preview_key=${PREVIEW_KEY}" >> "$GITHUB_OUTPUT"
+
+      - name: Report success to backend
+        if: success()
+        run: |
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/media-callback/${{ github.event.inputs.film_id }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Media-Callback-Secret: ${{ secrets.MEDIA_CALLBACK_SECRET }}" \
+            -d "{\"status\":\"completed\",\"thumbKey\":\"${{ steps.upload.outputs.thumb_key }}\",\"previewKey\":\"${{ steps.upload.outputs.preview_key }}\",\"sourceHeight\":${{ steps.probe.outputs.height }},\"durationSeconds\":${{ steps.probe.outputs.duration }}}"
+
+      - name: Report failure to backend
+        if: failure()
+        run: |
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/media-callback/${{ github.event.inputs.film_id }}" \
+            -H "Content-Type: application/json" \
+            -H "X-Media-Callback-Secret: ${{ secrets.MEDIA_CALLBACK_SECRET }}" \
+            -d "{\"status\":\"failed\",\"error\":\"ffmpeg pipeline failed — check this workflow run's logs\"}"
