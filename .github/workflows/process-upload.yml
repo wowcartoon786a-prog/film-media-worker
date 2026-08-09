@@ -19,6 +19,13 @@ jobs:
     timeout-minutes: 120
 
     steps:
+      - name: Report job started
+        run: |
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/uploads/${{ github.event.inputs.film_id }}/callback" \
+            -H "Content-Type: application/json" \
+            -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" \
+            -d "{\"status\":\"running\"}" || true
+
       - name: Verify ffmpeg is available
         run: |
           ffmpeg -version
@@ -74,15 +81,15 @@ jobs:
       - name: Report success to backend
         if: success()
         run: |
-          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/media-callback/${{ github.event.inputs.film_id }}" \
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/uploads/${{ github.event.inputs.film_id }}/callback" \
             -H "Content-Type: application/json" \
-            -H "X-Media-Callback-Secret: ${{ secrets.MEDIA_CALLBACK_SECRET }}" \
+            -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" \
             -d "{\"status\":\"completed\",\"thumbKey\":\"${{ steps.upload.outputs.thumb_key }}\",\"previewKey\":\"${{ steps.upload.outputs.preview_key }}\",\"sourceHeight\":${{ steps.probe.outputs.height }},\"durationSeconds\":${{ steps.probe.outputs.duration }}}"
 
       - name: Report failure to backend
         if: failure()
         run: |
-          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/media-callback/${{ github.event.inputs.film_id }}" \
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/uploads/${{ github.event.inputs.film_id }}/callback" \
             -H "Content-Type: application/json" \
-            -H "X-Media-Callback-Secret: ${{ secrets.MEDIA_CALLBACK_SECRET }}" \
+            -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" \
             -d "{\"status\":\"failed\",\"error\":\"ffmpeg pipeline failed — check this workflow run's logs\"}"

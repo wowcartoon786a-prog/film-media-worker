@@ -1,0 +1,52 @@
+name: Reindex Search
+
+# Manually triggerable via the Actions tab, or dispatched by the light
+# backend when an admin clicks "Reindex Search".
+on:
+  workflow_dispatch:
+    inputs:
+      job_run_id:
+        description: "Light backend's JobRun _id, for status callbacks"
+        required: true
+
+jobs:
+  reindex:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: scripts
+
+      - name: Report job started
+        run: |
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/jobs/${{ github.event.inputs.job_run_id }}/start" \
+            -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" || true
+
+      - name: Run reindex
+        env:
+          NOMIC_API_KEY: ${{ secrets.NOMIC_API_KEY }}
+          QDRANT_URL: ${{ secrets.QDRANT_URL }}
+          QDRANT_API_KEY: ${{ secrets.QDRANT_API_KEY }}
+          QDRANT_COLLECTION: ${{ vars.QDRANT_COLLECTION || 'films' }}
+          BACKEND_CALLBACK_URL: ${{ secrets.BACKEND_CALLBACK_URL }}
+          SERVICE_API_SECRET: ${{ secrets.SERVICE_API_SECRET }}
+          JOB_RUN_ID: ${{ github.event.inputs.job_run_id }}
+        run: node scripts/qdrantReindex.js
+
+      - name: Report failure to backend
+        if: failure()
+        run: |
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/jobs/${{ github.event.inputs.job_run_id }}/complete" \
+            -H "Content-Type: application/json" \
+            -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" \
+            -d "{\"status\":\"failed\",\"error\":\"Reindex script failed — check this workflow run's logs\"}"

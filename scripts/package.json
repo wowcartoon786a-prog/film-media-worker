@@ -1,0 +1,9 @@
+{
+  "name": "film-media-worker-scripts",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Node scripts run by this repo's GitHub Actions workflows",
+  "dependencies": {
+    "@qdrant/js-client-rest": "^1.11.0"
+  }
+}

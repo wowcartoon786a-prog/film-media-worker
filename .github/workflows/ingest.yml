@@ -1,0 +1,61 @@
+name: Ingest Films
+
+# Manually triggerable via the Actions tab, or dispatched by the light
+# backend when an admin clicks "Run Ingestion". Also runs on a daily
+# schedule independently of the light backend, since ingestion doesn't
+# need anything admin-initiated to make sense on a cadence.
+on:
+  workflow_dispatch:
+    inputs:
+      job_run_id:
+        description: "Light backend's JobRun _id, for status callbacks"
+        required: true
+  schedule:
+    - cron: "0 6 * * *"
+
+jobs:
+  ingest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    env:
+      # Repo variables (Settings → Secrets and variables → Actions →
+      # Variables tab) — not secrets, since these aren't sensitive.
+      INGEST_COLLECTION: ${{ vars.INGEST_COLLECTION || 'prelinger' }}
+      INGEST_ROWS: ${{ vars.INGEST_ROWS || '20' }}
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: scripts
+
+      - name: Report job started
+        if: github.event_name == 'workflow_dispatch'
+        run: |
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/jobs/${{ github.event.inputs.job_run_id }}/start" \
+            -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" || true
+
+      - name: Run ingestion
+        id: run
+        env:
+          TMDB_API_KEY: ${{ secrets.TMDB_API_KEY }}
+          BACKEND_CALLBACK_URL: ${{ secrets.BACKEND_CALLBACK_URL }}
+          SERVICE_API_SECRET: ${{ secrets.SERVICE_API_SECRET }}
+          JOB_RUN_ID: ${{ github.event.inputs.job_run_id }}
+        run: node scripts/ingest.js
+
+      - name: Report failure to backend
+        if: failure() && github.event_name == 'workflow_dispatch'
+        run: |
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/jobs/${{ github.event.inputs.job_run_id }}/complete" \
+            -H "Content-Type: application/json" \
+            -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" \
+            -d "{\"status\":\"failed\",\"error\":\"Ingestion script failed — check this workflow run's logs\"}"
