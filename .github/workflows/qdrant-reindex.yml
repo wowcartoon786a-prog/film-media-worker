@@ -41,6 +41,7 @@ jobs:
           BACKEND_CALLBACK_URL: ${{ secrets.BACKEND_CALLBACK_URL }}
           SERVICE_API_SECRET: ${{ secrets.SERVICE_API_SECRET }}
           JOB_RUN_ID: ${{ github.event.inputs.job_run_id }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
         run: node scripts/qdrantReindex.js
 
       - name: Report failure to backend

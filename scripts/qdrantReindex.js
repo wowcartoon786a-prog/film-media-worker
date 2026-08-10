@@ -10,6 +10,15 @@
  */
 
 const { QdrantClient } = require("@qdrant/js-client-rest");
+const Sentry = require("@sentry/node");
+
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    environment: "heavy-backend",
+    initialScope: { tags: { service: "heavy-backend", script: "qdrant-reindex" } },
+  });
+}
 
 const NOMIC_API_KEY = process.env.NOMIC_API_KEY;
 const QDRANT_URL = process.env.QDRANT_URL;
@@ -139,10 +148,15 @@ async function run() {
 
 run().catch(async (err) => {
   console.error("Reindex run failed:", err.message);
+  Sentry.captureException(err);
   try {
     await reportComplete("failed", null, err.message);
   } catch (reportErr) {
     console.error("Additionally failed to report failure:", reportErr.message);
+    Sentry.captureException(reportErr);
   }
+  // Sentry sends events over the network asynchronously — without this,
+  // the process could exit before the events actually get delivered.
+  await Sentry.flush(2000).catch(() => {});
   process.exit(1);
 });

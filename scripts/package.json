@@ -4,6 +4,7 @@
   "private": true,
   "description": "Node scripts run by this repo's GitHub Actions workflows",
   "dependencies": {
-    "@qdrant/js-client-rest": "^1.11.0"
+    "@qdrant/js-client-rest": "^1.11.0",
+    "@sentry/node": "^8.42.0"
   }
 }

@@ -14,6 +14,15 @@
  */
 
 const crypto = require("crypto");
+const Sentry = require("@sentry/node");
+
+if (process.env.SENTRY_DSN) {
+  Sentry.init({
+    dsn: process.env.SENTRY_DSN,
+    environment: "heavy-backend",
+    initialScope: { tags: { service: "heavy-backend", script: "ingest" } },
+  });
+}
 
 const TMDB_API_KEY = process.env.TMDB_API_KEY;
 const ARCHIVE_COLLECTION = process.env.INGEST_COLLECTION || "prelinger";
@@ -240,7 +249,11 @@ async function run() {
   }
 }
 
-run().catch((err) => {
+run().catch(async (err) => {
   console.error("Ingestion run failed:", err.message);
+  Sentry.captureException(err);
+  // Sentry sends events over the network asynchronously — without this,
+  // the process could exit before the event actually gets delivered.
+  await Sentry.flush(2000).catch(() => {});
   process.exit(1);
 });
