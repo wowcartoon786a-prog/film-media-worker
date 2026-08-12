@@ -97,7 +97,7 @@ async function searchArchiveOrg() {
     }));
 }
 
-async function getBestStreamUrl(identifier) {
+async function getBestFile(identifier) {
   const url = `https://archive.org/metadata/${encodeURIComponent(identifier)}`;
   const data = await fetchJson(url, {}, `Archive.org metadata for ${identifier}`);
 
@@ -108,7 +108,12 @@ async function getBestStreamUrl(identifier) {
   if (mp4Files.length === 0) return null;
 
   mp4Files.sort((a, b) => Number(b.size || 0) - Number(a.size || 0));
-  return `https://archive.org/download/${identifier}/${mp4Files[0].name}`;
+  const best = mp4Files[0];
+
+  return {
+    streamUrl: `https://archive.org/download/${identifier}/${best.name}`,
+    fileSizeBytes: best.size ? Number(best.size) : undefined,
+  };
 }
 
 // --- TMDb ---
@@ -204,11 +209,12 @@ async function run() {
 
   for (const candidate of newCandidates) {
     try {
-      const streamUrl = await getBestStreamUrl(candidate.identifier);
-      if (!streamUrl) {
+      const bestFile = await getBestFile(candidate.identifier);
+      if (!bestFile) {
         errors.push(`${candidate.identifier}: no .mp4 file found in Archive.org metadata`);
         continue;
       }
+      const { streamUrl, fileSizeBytes } = bestFile;
 
       const tmdbInfo = await searchTmdb(candidate.title, candidate.year, genreMap);
       await sleep(TMDB_REQUEST_DELAY_MS);
@@ -221,6 +227,7 @@ async function run() {
         category: tmdbInfo?.genres?.length ? tmdbInfo.genres : ["Uncategorized"],
         streamUrl,
         downloadUrl: streamUrl,
+        fileSizeBytes,
         license: { source: "archive.org", type: "public-domain", attributionRequired: false },
         source: "archive.org",
         archiveIdentifier: candidate.identifier,
