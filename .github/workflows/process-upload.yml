@@ -10,7 +10,10 @@ on:
         description: "MongoDB _id of the film to process"
         required: true
       master_key:
-        description: "R2 object key of the uploaded master video"
+        description: "Object key of the uploaded master video"
+        required: true
+      storage_provider:
+        description: "Which storage provider the master lives on (r2, b2, or storj)"
         required: true
 
 jobs:
@@ -36,18 +39,48 @@ jobs:
           ffmpeg -version
           ffprobe -version
 
-      - name: Configure AWS CLI for R2
+      # --- Resolve which provider's credentials/endpoint/bucket to use ---
+      # All three providers are S3-compatible, so the same aws-cli commands
+      # work for all of them further down — only the endpoint, bucket, and
+      # credentials differ. Exported as env vars here (rather than
+      # `aws configure set`, which only supports one active profile at a
+      # time) so every later `aws s3` command just picks them up
+      # automatically via the CLI's standard env-var auth.
+      - name: Resolve storage provider credentials
+        id: provider
         run: |
-          aws configure set aws_access_key_id "${{ secrets.R2_ACCESS_KEY_ID }}"
-          aws configure set aws_secret_access_key "${{ secrets.R2_SECRET_ACCESS_KEY }}"
-          aws configure set default.region auto
+          case "${{ github.event.inputs.storage_provider }}" in
+            r2)
+              echo "endpoint_url=https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" >> "$GITHUB_OUTPUT"
+              echo "bucket=${{ secrets.R2_BUCKET }}" >> "$GITHUB_OUTPUT"
+              echo "AWS_ACCESS_KEY_ID=${{ secrets.R2_ACCESS_KEY_ID }}" >> "$GITHUB_ENV"
+              echo "AWS_SECRET_ACCESS_KEY=${{ secrets.R2_SECRET_ACCESS_KEY }}" >> "$GITHUB_ENV"
+              echo "AWS_DEFAULT_REGION=auto" >> "$GITHUB_ENV"
+              ;;
+            b2)
+              echo "endpoint_url=${{ secrets.B2_ENDPOINT }}" >> "$GITHUB_OUTPUT"
+              echo "bucket=${{ secrets.B2_BUCKET }}" >> "$GITHUB_OUTPUT"
+              echo "AWS_ACCESS_KEY_ID=${{ secrets.B2_ACCESS_KEY_ID }}" >> "$GITHUB_ENV"
+              echo "AWS_SECRET_ACCESS_KEY=${{ secrets.B2_SECRET_ACCESS_KEY }}" >> "$GITHUB_ENV"
+              echo "AWS_DEFAULT_REGION=${{ secrets.B2_REGION }}" >> "$GITHUB_ENV"
+              ;;
+            storj)
+              echo "endpoint_url=https://gateway.storjshare.io" >> "$GITHUB_OUTPUT"
+              echo "bucket=${{ secrets.STORJ_BUCKET }}" >> "$GITHUB_OUTPUT"
+              echo "AWS_ACCESS_KEY_ID=${{ secrets.STORJ_ACCESS_KEY_ID }}" >> "$GITHUB_ENV"
+              echo "AWS_SECRET_ACCESS_KEY=${{ secrets.STORJ_SECRET_ACCESS_KEY }}" >> "$GITHUB_ENV"
+              echo "AWS_DEFAULT_REGION=us-east-1" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "Unknown storage_provider: '${{ github.event.inputs.storage_provider }}' (expected r2, b2, or storj)"
+              exit 1
+              ;;
+          esac
 
-      - name: Download master file from R2
-        env:
-          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      - name: Download master file from storage
         run: |
-          aws s3 cp "s3://${{ secrets.R2_BUCKET }}/${{ github.event.inputs.master_key }}" \
-            ./master.mp4 --endpoint-url "$R2_ENDPOINT"
+          aws s3 cp "s3://${{ steps.provider.outputs.bucket }}/${{ github.event.inputs.master_key }}" \
+            ./master.mp4 --endpoint-url "${{ steps.provider.outputs.endpoint_url }}"
 
       - name: Probe video (duration + height)
         id: probe
@@ -63,22 +96,21 @@ jobs:
       - name: Generate 30s preview
         run: ffmpeg -y -i master.mp4 -t 30 -vf scale=480:-1 preview.mp4
 
-      - name: Upload results to R2
+      - name: Upload results back to the same storage provider
         id: upload
         env:
-          R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
           MASTER_KEY: ${{ github.event.inputs.master_key }}
         run: |
           # Derive sibling keys from the master's key, stripping its extension,
-          # so thumbnail/preview sit next to the master in the bucket.
+          # so thumbnail/preview sit next to the master in the same bucket.
           BASE="${MASTER_KEY%.*}"
           THUMB_KEY="${BASE}-thumb.jpg"
           PREVIEW_KEY="${BASE}-preview.mp4"
 
-          aws s3 cp thumb.jpg "s3://${{ secrets.R2_BUCKET }}/${THUMB_KEY}" \
-            --endpoint-url "$R2_ENDPOINT" --content-type image/jpeg
-          aws s3 cp preview.mp4 "s3://${{ secrets.R2_BUCKET }}/${PREVIEW_KEY}" \
-            --endpoint-url "$R2_ENDPOINT" --content-type video/mp4
+          aws s3 cp thumb.jpg "s3://${{ steps.provider.outputs.bucket }}/${THUMB_KEY}" \
+            --endpoint-url "${{ steps.provider.outputs.endpoint_url }}" --content-type image/jpeg
+          aws s3 cp preview.mp4 "s3://${{ steps.provider.outputs.bucket }}/${PREVIEW_KEY}" \
+            --endpoint-url "${{ steps.provider.outputs.endpoint_url }}" --content-type video/mp4
 
           echo "thumb_key=${THUMB_KEY}" >> "$GITHUB_OUTPUT"
           echo "preview_key=${PREVIEW_KEY}" >> "$GITHUB_OUTPUT"
@@ -98,3 +130,4 @@ jobs:
             -H "Content-Type: application/json" \
             -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" \
             -d "{\"status\":\"failed\",\"error\":\"ffmpeg pipeline failed — check this workflow run's logs\"}"
+            
