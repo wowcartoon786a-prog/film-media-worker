@@ -49,6 +49,18 @@ jobs:
       - name: Resolve storage provider credentials
         id: provider
         run: |
+          # Newer aws-cli versions default to streaming uploads with an
+          # auto-computed checksum ("aws-chunked" transfer encoding). R2
+          # tolerates this fine, but Backblaze B2 and Storj's gateway
+          # reject it outright with "MissingContentLength" — they expect
+          # a plain, definite Content-Length header instead. Forcing the
+          # older behavior here fixes uploads on all three providers;
+          # this is the aws-cli equivalent of the same fix already
+          # applied to the Node SDK client in backend/services/storage.js
+          # and the B2/Storj adapters (requestChecksumCalculation).
+          echo "AWS_REQUEST_CHECKSUM_CALCULATION=when_required" >> "$GITHUB_ENV"
+          echo "AWS_RESPONSE_CHECKSUM_VALIDATION=when_required" >> "$GITHUB_ENV"
+
           case "${{ github.event.inputs.storage_provider }}" in
             r2)
               echo "endpoint_url=https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" >> "$GITHUB_OUTPUT"
