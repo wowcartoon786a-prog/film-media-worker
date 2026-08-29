@@ -106,7 +106,15 @@ jobs:
         run: ffmpeg -y -ss 5 -i master.mp4 -vframes 1 thumb.jpg
 
       - name: Generate 30s preview
-        run: ffmpeg -y -i master.mp4 -t 30 -vf scale=480:-1 preview.mp4
+        # scale's second dimension uses -2, not -1: -1 preserves aspect
+        # ratio but can compute an ODD number (e.g. a 1080x1920 portrait
+        # source scales to 480x853.33 -> truncated to 853), and libx264
+        # requires both width and height to be even (chroma subsampling
+        # needs it) — failing outright with "height not divisible by 2".
+        # -2 does the same aspect-preserving auto-compute but always
+        # rounds to the nearest even number, fixing this for any source
+        # aspect ratio, portrait or landscape.
+        run: ffmpeg -y -i master.mp4 -t 30 -vf scale=480:-2 preview.mp4
 
       - name: Upload results back to the same storage provider
         id: upload
