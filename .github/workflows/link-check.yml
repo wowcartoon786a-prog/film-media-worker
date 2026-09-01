@@ -1,0 +1,54 @@
+name: Check Links
+
+# Weekly sweep of every approved film's stream URL. Also manually
+# triggerable via the Actions tab, or dispatched by the light backend
+# when an admin runs it from /admin/tools (job_run_id set in that case;
+# empty on the scheduled run, which has no JobRun to report against).
+on:
+  workflow_dispatch:
+    inputs:
+      job_run_id:
+        description: "Light backend's JobRun _id, for status callbacks (leave blank for a manual/local test run)"
+        required: false
+  schedule:
+    - cron: "0 7 * * 1" # every Monday at 07:00 UTC
+
+jobs:
+  check-links:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install dependencies
+        run: npm install
+        working-directory: scripts
+
+      - name: Report job started
+        if: github.event.inputs.job_run_id != ''
+        run: |
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/jobs/${{ github.event.inputs.job_run_id }}/start" \
+            -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" || true
+
+      - name: Run link check
+        env:
+          BACKEND_CALLBACK_URL: ${{ secrets.BACKEND_CALLBACK_URL }}
+          SERVICE_API_SECRET: ${{ secrets.SERVICE_API_SECRET }}
+          JOB_RUN_ID: ${{ github.event.inputs.job_run_id }}
+          SENTRY_DSN: ${{ secrets.SENTRY_DSN }}
+        run: node scripts/checkLinks.js
+
+      - name: Report failure to backend
+        if: failure() && github.event.inputs.job_run_id != ''
+        run: |
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/jobs/${{ github.event.inputs.job_run_id }}/complete" \
+            -H "Content-Type: application/json" \
+            -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" \
+            -d "{\"status\":\"failed\",\"error\":\"Link check script failed — check this workflow run's logs\"}"
