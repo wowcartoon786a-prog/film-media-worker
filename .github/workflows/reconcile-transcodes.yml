@@ -1,0 +1,27 @@
+name: Reconcile Stuck Transcodes
+
+# Slice 14 — a pure maintenance sweep, unlike every other workflow in this
+# repo. ingest.yml, link-check.yml, qdrant-reindex.yml, and
+# process-upload.yml all do real external work (Archive.org, TMDb,
+# Nomic/Qdrant, ffmpeg) and need their own Node script under scripts/.
+# This one doesn't touch any of that — it has nothing to probe, download,
+# or upload. It just asks the light backend to check its OWN Film
+# collection for anything stuck in transcodeStatus: "processing" past a
+# timeout, and lets the backend handle the retry/give-up logic itself
+# (see backend/controllers/serviceController.js's
+# reconcileStuckTranscodes). A single curl call is the entire job.
+on:
+  workflow_dispatch: {}
+  schedule:
+    - cron: "*/30 * * * *" # every 30 minutes
+
+jobs:
+  reconcile:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Ask the backend to reconcile stuck transcodes
+        run: |
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/transcodes/reconcile-stuck" \
+            -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}"

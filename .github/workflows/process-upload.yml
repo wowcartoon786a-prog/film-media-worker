@@ -143,11 +143,20 @@ jobs:
             -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" \
             -d "{\"status\":\"completed\",\"thumbKey\":\"${{ steps.upload.outputs.thumb_key }}\",\"previewKey\":\"${{ steps.upload.outputs.preview_key }}\",\"sourceHeight\":${{ steps.probe.outputs.height }},\"durationSeconds\":${{ steps.probe.outputs.duration }}}"
 
+      # Slice 14 fix: `if: failure()` alone does NOT fire when this job is
+      # killed by its own `timeout-minutes: 120` ceiling above — GitHub
+      # marks a timed-out job "cancelled", not "failed", and failure()
+      # evaluates to false for a cancellation. That meant the one case
+      # this step exists to catch — a genuinely hung run — was exactly
+      # the case it silently missed: the callback never arrived, and the
+      # film sat in transcodeStatus: "processing" forever with nothing
+      # watching it. Adding `|| cancelled()` closes that gap; anything
+      # still stuck after this fix instead gets caught by the
+      # reconcile-transcodes.yml sweep in this same repo.
       - name: Report failure to backend
-        if: failure()
+        if: failure() || cancelled()
         run: |
           curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/uploads/${{ github.event.inputs.film_id }}/callback" \
             -H "Content-Type: application/json" \
             -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" \
-            -d "{\"status\":\"failed\",\"error\":\"ffmpeg pipeline failed — check this workflow run's logs\"}"
-            
+            -d "{\"status\":\"failed\",\"error\":\"ffmpeg pipeline failed or timed out — check this workflow run's logs\"}"
