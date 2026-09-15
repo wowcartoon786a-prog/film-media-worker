@@ -1,0 +1,164 @@
+name: ABR Transcode
+
+# Slice 15 — produces a multi-resolution, multi-audio HLS ladder for an
+# own-upload, entirely separate from Process Upload (process-upload.yml),
+# which stays exactly as fast as it's always been (thumbnail + 30s
+# preview only). This job is dispatched separately, after the light
+# backend decides eligibility (source >= 480p AND the admin's
+# "generate multiple quality levels" upload-form toggle was on) — see
+# backend/controllers/serviceController.js's decideAndDispatchAbr.
+#
+# Runs meaningfully longer than Process Upload (multiple full
+# re-encodes, not a single fast pass) — timeout-minutes: 300 stays
+# comfortably under GitHub's hard 360-minute per-job ceiling on standard
+# runners while giving real headroom for a large multi-rung,
+# multi-audio source.
+on:
+  workflow_dispatch:
+    inputs:
+      film_id:
+        description: "MongoDB _id of the film to process"
+        required: true
+      master_key:
+        description: "Object key of the uploaded master video"
+        required: true
+      storage_provider:
+        description: "Which storage provider the master lives on (r2, b2, or storj)"
+        required: true
+
+jobs:
+  abr-transcode:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Install ffmpeg
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y ffmpeg
+
+      - name: Verify tools are available
+        run: |
+          ffmpeg -version
+          ffprobe -version
+          jq --version
+
+      # --- Resolve which provider's credentials/endpoint/bucket to use ---
+      # Identical to process-upload.yml's own step — kept duplicated
+      # rather than factored into a composite action, since this repo is
+      # intentionally small (a handful of workflow files, no shared
+      # tooling infrastructure) and a composite action would be more
+      # ceremony than the duplication it removes.
+      - name: Resolve storage provider credentials
+        id: provider
+        run: |
+          echo "AWS_REQUEST_CHECKSUM_CALCULATION=when_required" >> "$GITHUB_ENV"
+          echo "AWS_RESPONSE_CHECKSUM_VALIDATION=when_required" >> "$GITHUB_ENV"
+
+          case "${{ github.event.inputs.storage_provider }}" in
+            r2)
+              echo "endpoint_url=https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com" >> "$GITHUB_OUTPUT"
+              echo "bucket=${{ secrets.R2_BUCKET }}" >> "$GITHUB_OUTPUT"
+              echo "AWS_ACCESS_KEY_ID=${{ secrets.R2_ACCESS_KEY_ID }}" >> "$GITHUB_ENV"
+              echo "AWS_SECRET_ACCESS_KEY=${{ secrets.R2_SECRET_ACCESS_KEY }}" >> "$GITHUB_ENV"
+              echo "AWS_DEFAULT_REGION=auto" >> "$GITHUB_ENV"
+              ;;
+            b2)
+              echo "endpoint_url=${{ secrets.B2_ENDPOINT }}" >> "$GITHUB_OUTPUT"
+              echo "bucket=${{ secrets.B2_BUCKET }}" >> "$GITHUB_OUTPUT"
+              echo "AWS_ACCESS_KEY_ID=${{ secrets.B2_ACCESS_KEY_ID }}" >> "$GITHUB_ENV"
+              echo "AWS_SECRET_ACCESS_KEY=${{ secrets.B2_SECRET_ACCESS_KEY }}" >> "$GITHUB_ENV"
+              echo "AWS_DEFAULT_REGION=${{ secrets.B2_REGION }}" >> "$GITHUB_ENV"
+              ;;
+            storj)
+              echo "endpoint_url=https://gateway.storjshare.io" >> "$GITHUB_OUTPUT"
+              echo "bucket=${{ secrets.STORJ_BUCKET }}" >> "$GITHUB_OUTPUT"
+              echo "AWS_ACCESS_KEY_ID=${{ secrets.STORJ_ACCESS_KEY_ID }}" >> "$GITHUB_ENV"
+              echo "AWS_SECRET_ACCESS_KEY=${{ secrets.STORJ_SECRET_ACCESS_KEY }}" >> "$GITHUB_ENV"
+              echo "AWS_DEFAULT_REGION=us-east-1" >> "$GITHUB_ENV"
+              ;;
+            *)
+              echo "Unknown storage_provider: '${{ github.event.inputs.storage_provider }}' (expected r2, b2, or storj)"
+              exit 1
+              ;;
+          esac
+
+      - name: Download master file from storage
+        run: |
+          aws s3 cp "s3://${{ steps.provider.outputs.bucket }}/${{ github.event.inputs.master_key }}" \
+            ./master.mp4 --endpoint-url "${{ steps.provider.outputs.endpoint_url }}"
+
+      - name: Build the ABR ladder
+        run: bash scripts/buildAbrLadder.sh
+
+      - name: Upload HLS output to storage
+        id: upload
+        env:
+          FILM_ID: ${{ github.event.inputs.film_id }}
+        run: |
+          HLS_PREFIX="uploads/${FILM_ID}/hls"
+
+          aws s3 cp --recursive output/ "s3://${{ steps.provider.outputs.bucket }}/${HLS_PREFIX}/" \
+            --endpoint-url "${{ steps.provider.outputs.endpoint_url }}"
+
+          echo "hls_prefix=${HLS_PREFIX}" >> "$GITHUB_OUTPUT"
+
+          TOTAL_BYTES=$(du -sb output/ | cut -f1)
+          echo "total_bytes=${TOTAL_BYTES}" >> "$GITHUB_OUTPUT"
+
+      - name: Build callback payload
+        id: payload
+        run: |
+          HLS_PREFIX="${{ steps.upload.outputs.hls_prefix }}"
+
+          # Fill in segmentCount + final storage key for each rendition
+          # produced by buildAbrLadder.sh — that script only knows
+          # resolution/bitrate, not where things end up in storage or
+          # how many segments were cut, since neither is decided until
+          # after upload.
+          RENDITIONS=$(jq -c '.renditions' output/manifest-info.json)
+          FINAL_RENDITIONS="[]"
+          for row in $(echo "$RENDITIONS" | jq -c '.[]'); do
+            IDX=$(echo "$row" | jq -r '.streamIndex')
+            SEGMENT_COUNT=$(find "output/stream_${IDX}" -name '*.ts' 2>/dev/null | wc -l)
+            KEY="${HLS_PREFIX}/stream_${IDX}.m3u8"
+            FINAL_RENDITIONS=$(echo "$FINAL_RENDITIONS" | jq --argjson r "$row" --argjson segCount "$SEGMENT_COUNT" --arg key "$KEY" \
+              '. + [$r + {segmentCount: $segCount, key: $key} | del(.streamIndex)]')
+          done
+
+          AUDIO_TRACKS=$(jq -c '.audioTracks' output/manifest-info.json)
+
+          jq -n \
+            --arg manifestKey "${HLS_PREFIX}/master.m3u8" \
+            --argjson renditions "$FINAL_RENDITIONS" \
+            --argjson audioTracks "$AUDIO_TRACKS" \
+            --argjson totalOutputBytes "${{ steps.upload.outputs.total_bytes }}" \
+            '{status: "completed", manifestKey: $manifestKey, renditions: $renditions, audioTracks: $audioTracks, totalOutputBytes: $totalOutputBytes}' \
+            > callback_payload.json
+
+          cat callback_payload.json
+
+      - name: Report success to backend
+        if: success()
+        run: |
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/uploads/${{ github.event.inputs.film_id }}/abr-callback" \
+            -H "Content-Type: application/json" \
+            -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" \
+            -d @callback_payload.json
+
+      # See Slice 14's fix on process-upload.yml for why this must check
+      # cancelled() too, not just failure() — a job killed by its own
+      # timeout-minutes ceiling above is marked "cancelled", not
+      # "failed", and failure() alone would silently miss it, leaving
+      # this film stuck in abrStatus: "processing" with nothing watching
+      # it except the (much slower) reconcile-transcodes.yml sweep.
+      - name: Report failure to backend
+        if: failure() || cancelled()
+        run: |
+          curl -sf -X POST "${{ secrets.BACKEND_CALLBACK_URL }}/api/service/uploads/${{ github.event.inputs.film_id }}/abr-callback" \
+            -H "Content-Type: application/json" \
+            -H "X-Service-Secret: ${{ secrets.SERVICE_API_SECRET }}" \
+            -d "{\"status\":\"failed\",\"error\":\"ABR transcode pipeline failed or timed out — check this workflow run's logs\"}"
