@@ -7,7 +7,7 @@ set -euo pipefail
 # (already downloaded by the calling workflow step) into ./output/.
 # Called by .github/workflows/abr-transcode.yml — kept as its own script
 # rather than an inline `run:` block because the ffmpeg command it builds
-# is genuinely dynamic (1-3 resolution rungs, 1-N audio tracks) and would
+# is genuinely dynamic (1-3 resolution rungs, 0-N audio tracks) and would
 # be unreadable embedded directly in YAML.
 #
 # Writes ./output/manifest-info.json describing what was actually
@@ -28,6 +28,15 @@ set -euo pipefail
 # single-audio-vs-multi-audio code paths — a single-audio source is just
 # the N=1 case of the same audio-mapping loop used for multi-audio
 # sources, so there's no need for a real branch between them.
+#
+# SILENT SOURCES: a source with zero audio streams is a real, expected
+# case for this app, not an error — its own category taxonomy includes
+# "Silent Film", and general home-movie/archive.org content genuinely
+# has none sometimes (confirmed in practice: an early version of this
+# script hard-failed on exactly this case for a real 1947 home movie).
+# When AUDIO_COUNT is 0, this script produces a video-only HLS ladder —
+# a standard, fully valid HLS shape (variant streams with no attached
+# EXT-X-MEDIA audio group) — rather than exiting with an error.
 
 INPUT="master.mp4"
 OUTPUT_DIR="output"
@@ -66,17 +75,18 @@ AUDIO_JSON=$(ffprobe -v error -select_streams a -show_entries stream=index:strea
 AUDIO_COUNT=$(echo "$AUDIO_JSON" | jq '.streams | length')
 
 if [ "$AUDIO_COUNT" -eq 0 ]; then
-  echo "ERROR: no audio streams detected in source." >&2
-  exit 1
+  echo "No audio streams detected — generating a video-only HLS ladder (silent source)."
+else
+  echo "Detected ${AUDIO_COUNT} audio stream(s)."
 fi
-
-echo "Detected ${AUDIO_COUNT} audio stream(s)."
 
 # Build per-stream language/label/default arrays. Language defaults to
 # "und" (undetermined) when the source has no language tag at all —
 # common for amateur/own-upload rips. Never guess a language that
 # wasn't actually tagged. The default (auto-selected) track is whichever
 # stream is tagged "eng", if any; otherwise the first stream by index.
+# These arrays simply stay empty when AUDIO_COUNT is 0 — the loop below
+# never runs.
 LANGUAGES=()
 LABELS=()
 DEFAULT_AUDIO_POSITION=0
@@ -113,14 +123,25 @@ done
 
 FFMPEG_ARGS=(-i "$INPUT" -filter_complex "$FILTER")
 
+# Video rungs — only attach an agroup (linking each video rendition to
+# the shared audio group) when there IS an audio group to link to. A
+# silent source's variants stand alone with no agroup at all, which is
+# valid HLS (a video-only variant stream).
 VIDEO_STREAM_MAP=()
 for ((i = 0; i < NUM_RUNGS; i++)); do
   H="${RUNGS[$i]}"
   BR="${BITRATE[$H]}"
   FFMPEG_ARGS+=(-map "[v$((i + 1))out]" -c:v:"$i" libx264 -preset veryfast -b:v:"$i" "$BR" -g 48 -keyint_min 48 -sc_threshold 0)
-  VIDEO_STREAM_MAP+=("v:${i},agroup:audio-main")
+  if [ "$AUDIO_COUNT" -gt 0 ]; then
+    VIDEO_STREAM_MAP+=("v:${i},agroup:audio-main")
+  else
+    VIDEO_STREAM_MAP+=("v:${i}")
+  fi
 done
 
+# Audio rungs — this loop simply does nothing when AUDIO_COUNT is 0, so
+# no -map 0:a:* args and no agroup entries are ever added for a silent
+# source, without needing a separate branch here.
 AUDIO_STREAM_MAP=()
 for ((i = 0; i < AUDIO_COUNT; i++)); do
   FFMPEG_ARGS+=(-map "0:a:$i" -c:a:"$i" aac -b:a:"$i" 128k)
@@ -132,7 +153,11 @@ for ((i = 0; i < AUDIO_COUNT; i++)); do
   AUDIO_STREAM_MAP+=("a:${i},agroup:audio-main,language:${LANG},default:${DEFAULT_FLAG}")
 done
 
-STREAM_MAP=$(IFS=' '; echo "${VIDEO_STREAM_MAP[*]} ${AUDIO_STREAM_MAP[*]}")
+if [ "$AUDIO_COUNT" -gt 0 ]; then
+  STREAM_MAP=$(IFS=' '; echo "${VIDEO_STREAM_MAP[*]} ${AUDIO_STREAM_MAP[*]}")
+else
+  STREAM_MAP=$(IFS=' '; echo "${VIDEO_STREAM_MAP[*]}")
+fi
 
 FFMPEG_ARGS+=(
   -f hls -hls_time 6 -hls_playlist_type vod
@@ -159,6 +184,9 @@ for ((i = 0; i < NUM_RUNGS; i++)); do
     '. + [{resolution: $res, height: $h, bitrateKbps: $br, streamIndex: $idx}]')
 done
 
+# Naturally produces "[]" when AUDIO_COUNT is 0 — a silent film's
+# audioTracks field on the Film document ends up empty/absent, which
+# the frontend already treats correctly (no track selector rendered).
 AUDIO_TRACKS_JSON="[]"
 for ((i = 0; i < AUDIO_COUNT; i++)); do
   IS_DEFAULT="false"
