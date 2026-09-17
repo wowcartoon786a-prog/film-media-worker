@@ -7,15 +7,16 @@ set -euo pipefail
 # (already downloaded by the calling workflow step) into ./output/.
 # Called by .github/workflows/abr-transcode.yml — kept as its own script
 # rather than an inline `run:` block because the ffmpeg command it builds
-# is genuinely dynamic (1-3 resolution rungs, 0-N audio tracks) and would
-# be unreadable embedded directly in YAML.
+# is genuinely dynamic (1-3 resolution rungs, 0-N audio tracks, 0-N
+# subtitle tracks) and would be unreadable embedded directly in YAML.
 #
 # Writes ./output/manifest-info.json describing what was actually
-# produced (resolution rungs + detected audio tracks). The calling
-# workflow reads this afterward to build the callback payload, once it
-# also knows the final storage keys and segment counts — this script
-# doesn't need to know anything about storage or the film's Mongo _id at
-# all, keeping it independently testable.
+# produced (resolution rungs + detected audio tracks + detected subtitle
+# tracks). The calling workflow reads this afterward to build the
+# callback payload, once it also knows the final storage keys and
+# segment counts — this script doesn't need to know anything about
+# storage or the film's Mongo _id at all, keeping it independently
+# testable.
 #
 # Every resolution rung, including the top one, is freshly re-encoded —
 # never a stream-copy of the source, even for the highest rung. Adaptive
@@ -37,6 +38,17 @@ set -euo pipefail
 # When AUDIO_COUNT is 0, this script produces a video-only HLS ladder —
 # a standard, fully valid HLS shape (variant streams with no attached
 # EXT-X-MEDIA audio group) — rather than exiting with an error.
+#
+# SLICE 16 — SUBTITLES: purely extraction of embedded subtitle streams
+# the source ALREADY carries (common in MKV rips) — no transcription, no
+# AI generation, no new tool or model. Only text-based subtitle codecs
+# (subrip/ass/ssa/mov_text/webvtt) can be converted to WebVTT at all;
+# bitmap-based codecs (PGS from Blu-ray rips, VobSub/dvd_subtitle from
+# DVD rips) are images, not text, and are skipped cleanly — logged, never
+# treated as a failure. A source with no usable embedded subtitles
+# produces byte-for-byte the same master.m3u8 as before this slice; the
+# manifest is only patched with #EXT-X-MEDIA:TYPE=SUBTITLES entries when
+# at least one qualifying track was actually extracted.
 
 INPUT="master.mp4"
 OUTPUT_DIR="output"
@@ -108,7 +120,69 @@ done
 # If no English track was found, DEFAULT_AUDIO_POSITION stays 0 (the
 # first stream), set above.
 
-# --- Build the dynamic ffmpeg filter_complex + stream map ---
+# --- Slice 16: probe subtitle streams — index + codec + language tag ---
+# Filtered to text-based codecs only (see header comment). SUB_INDEXES
+# holds the ORIGINAL ffprobe subtitle-relative stream index (what
+# `-map 0:s:N` needs); everything else is keyed by POSITION among
+# qualifying (extracted) tracks, 0-based and contiguous, which is what
+# both the output filenames (subs_0.vtt, subs_1.vtt, ...) and the
+# reported subtitleTracks array use — a skipped bitmap track never
+# leaves a gap in that numbering.
+SUBTITLE_JSON=$(ffprobe -v error -select_streams s -show_entries stream=index:codec_name:stream_tags=language -of json "$INPUT")
+SUBTITLE_STREAM_COUNT=$(echo "$SUBTITLE_JSON" | jq '.streams | length')
+
+TEXT_SUBTITLE_CODECS="subrip ass ssa mov_text webvtt"
+
+SUB_INDEXES=()
+SUB_LANGUAGES=()
+SUB_LABELS=()
+
+if [ "$SUBTITLE_STREAM_COUNT" -gt 0 ]; then
+  echo "Detected ${SUBTITLE_STREAM_COUNT} embedded subtitle stream(s) — filtering to text-based codecs."
+
+  for ((i = 0; i < SUBTITLE_STREAM_COUNT; i++)); do
+    CODEC=$(echo "$SUBTITLE_JSON" | jq -r ".streams[$i].codec_name")
+    LANG=$(echo "$SUBTITLE_JSON" | jq -r ".streams[$i].tags.language // \"und\"")
+
+    IS_TEXT=0
+    for TC in $TEXT_SUBTITLE_CODECS; do
+      if [ "$CODEC" = "$TC" ]; then
+        IS_TEXT=1
+        break
+      fi
+    done
+
+    if [ "$IS_TEXT" -eq 0 ]; then
+      echo "Skipping subtitle stream $i (codec: $CODEC) — bitmap-based or unsupported, cannot convert to WebVTT."
+      continue
+    fi
+
+    SUB_INDEXES+=("$i")
+    SUB_LANGUAGES+=("$LANG")
+    POSITION=$((${#SUB_INDEXES[@]} - 1))
+    if [ "$LANG" = "und" ]; then
+      SUB_LABELS+=("Subtitle $((POSITION + 1))")
+    else
+      SUB_LABELS+=("$(echo "$LANG" | tr '[:lower:]' '[:upper:]')")
+    fi
+  done
+else
+  echo "No embedded subtitle streams found."
+fi
+
+SUBTITLE_COUNT=${#SUB_INDEXES[@]}
+if [ "$SUBTITLE_COUNT" -gt 0 ]; then
+  echo "Extracting ${SUBTITLE_COUNT} text-based subtitle track(s)."
+elif [ "$SUBTITLE_STREAM_COUNT" -gt 0 ]; then
+  echo "No usable (text-based) embedded subtitle streams to extract — all were bitmap-based or unsupported."
+fi
+
+for ((pos = 0; pos < SUBTITLE_COUNT; pos++)); do
+  SIDX="${SUB_INDEXES[$pos]}"
+  ffmpeg -y -i "$INPUT" -map "0:s:${SIDX}" "${OUTPUT_DIR}/subs_${pos}.vtt"
+done
+
+# --- Build the dynamic ffmpeg filter_complex + stream map (video + audio only — subtitles are extracted separately above, not part of this command) ---
 NUM_RUNGS=${#RUNGS[@]}
 SPLIT_LABELS=""
 for ((i = 0; i < NUM_RUNGS; i++)); do
@@ -170,6 +244,58 @@ FFMPEG_ARGS+=(
 echo "Running: ffmpeg ${FFMPEG_ARGS[*]}"
 ffmpeg -y "${FFMPEG_ARGS[@]}"
 
+# --- Slice 16: patch master.m3u8 with subtitle EXT-X-MEDIA declarations ---
+# Only runs when at least one subtitle track was actually extracted — a
+# source with none produces byte-for-byte the same manifest as before
+# this slice, not a conditional variant of the file. No DEFAULT=YES is
+# ever set on any subtitle track (unlike audio) — subtitles are opt-in;
+# the player starts with them off and lets the viewer choose.
+if [ "$SUBTITLE_COUNT" -gt 0 ]; then
+  echo "Patching master.m3u8 with ${SUBTITLE_COUNT} subtitle track(s)."
+
+  MEDIA_LINES=""
+  for ((pos = 0; pos < SUBTITLE_COUNT; pos++)); do
+    LABEL="${SUB_LABELS[$pos]}"
+    LANG="${SUB_LANGUAGES[$pos]}"
+    MEDIA_LINES="${MEDIA_LINES}#EXT-X-MEDIA:TYPE=SUBTITLES,GROUP-ID=\"subs\",NAME=\"${LABEL}\",AUTOSELECT=YES,LANGUAGE=\"${LANG}\",URI=\"subs_${pos}.vtt\"
+"
+  done
+
+  MASTER="${OUTPUT_DIR}/master.m3u8"
+
+  # Inserts the EXT-X-MEDIA subtitle declarations right before the first
+  # real content line (typically the first #EXT-X-STREAM-INF), i.e.
+  # after #EXTM3U and, if present, #EXT-X-VERSION — rather than
+  # hardcoding "after line 1", which would insert BEFORE a VERSION tag
+  # if ffmpeg happens to write one on line 2. Also appends
+  # SUBTITLES="subs" onto every existing #EXT-X-STREAM-INF line so each
+  # resolution rendition correctly references the subtitle group.
+  # Done with awk + a temp file rather than sed -i for portability
+  # (GNU vs BSD sed's -i flag differs; this workflow always runs on
+  # ubuntu-latest anyway, but awk keeps the script trivially portable
+  # regardless).
+  awk -v media="$MEDIA_LINES" '
+    BEGIN { inserted = 0 }
+    {
+      if (!inserted && $0 !~ /^#EXTM3U/ && $0 !~ /^#EXT-X-VERSION/) {
+        printf "%s", media
+        inserted = 1
+      }
+      if ($0 ~ /^#EXT-X-STREAM-INF:/) {
+        sub(/$/, ",SUBTITLES=\"subs\"")
+        print
+        next
+      }
+      print
+    }
+  ' "$MASTER" > "${MASTER}.patched"
+
+  mv "${MASTER}.patched" "$MASTER"
+
+  echo "Patched master.m3u8:"
+  cat "$MASTER"
+fi
+
 # --- Write manifest-info.json describing what was produced ---
 # Segment counts and final storage keys aren't known here — the calling
 # workflow fills those in once it knows the upload prefix, after this
@@ -195,8 +321,24 @@ for ((i = 0; i < AUDIO_COUNT; i++)); do
     '. + [{index: $idx, language: $lang, label: $label, isDefault: $isDefault}]')
 done
 
-jq -n --argjson sourceHeight "$SRC_HEIGHT" --argjson renditions "$RENDITIONS_JSON" --argjson audioTracks "$AUDIO_TRACKS_JSON" \
-  '{sourceHeight: $sourceHeight, renditions: $renditions, audioTracks: $audioTracks}' > "${OUTPUT_DIR}/manifest-info.json"
+# Slice 16 — subtitleTracks. "index" here is the 0-based POSITION among
+# extracted tracks (matching the subs_N.vtt filenames), not the
+# original ffprobe subtitle-stream index — a skipped bitmap track never
+# leaves a gap. No "isDefault" field — subtitles have no default track
+# (see the patching step above).
+SUBTITLE_TRACKS_JSON="[]"
+for ((pos = 0; pos < SUBTITLE_COUNT; pos++)); do
+  SUBTITLE_TRACKS_JSON=$(echo "$SUBTITLE_TRACKS_JSON" | jq --argjson idx "$pos" --arg lang "${SUB_LANGUAGES[$pos]}" --arg label "${SUB_LABELS[$pos]}" \
+    '. + [{index: $idx, language: $lang, label: $label}]')
+done
+
+jq -n \
+  --argjson sourceHeight "$SRC_HEIGHT" \
+  --argjson renditions "$RENDITIONS_JSON" \
+  --argjson audioTracks "$AUDIO_TRACKS_JSON" \
+  --argjson subtitleTracks "$SUBTITLE_TRACKS_JSON" \
+  '{sourceHeight: $sourceHeight, renditions: $renditions, audioTracks: $audioTracks, subtitleTracks: $subtitleTracks}' \
+  > "${OUTPUT_DIR}/manifest-info.json"
 
 echo "Wrote ${OUTPUT_DIR}/manifest-info.json:"
 cat "${OUTPUT_DIR}/manifest-info.json"

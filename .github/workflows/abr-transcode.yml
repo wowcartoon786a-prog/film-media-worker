@@ -8,6 +8,12 @@ name: ABR Transcode
 # "generate multiple quality levels" upload-form toggle was on) — see
 # backend/controllers/serviceController.js's decideAndDispatchAbr.
 #
+# Slice 16 — also extracts and attaches any embedded, text-based
+# subtitle streams the source already carries (see scripts/
+# buildAbrLadder.sh) — no transcription, no new tool, no separate job;
+# subtitles ride along in this same run since it already downloads the
+# master file this extraction needs.
+#
 # Runs meaningfully longer than Process Upload (multiple full
 # re-encodes, not a single fast pass) — timeout-minutes: 300 stays
 # comfortably under GitHub's hard 360-minute per-job ceiling on standard
@@ -131,12 +137,29 @@ jobs:
 
           AUDIO_TRACKS=$(jq -c '.audioTracks' output/manifest-info.json)
 
+          # Slice 16 — same idea as renditions above: buildAbrLadder.sh
+          # only knows each subtitle track's position/language/label,
+          # not its final storage key (that depends on the upload
+          # prefix, decided here, after upload). "index" from
+          # manifest-info.json is already the 0-based position among
+          # EXTRACTED tracks (subs_0.vtt, subs_1.vtt, ...), matching
+          # this key construction directly.
+          SUBTITLE_TRACKS=$(jq -c '.subtitleTracks' output/manifest-info.json)
+          FINAL_SUBTITLE_TRACKS="[]"
+          for row in $(echo "$SUBTITLE_TRACKS" | jq -c '.[]'); do
+            IDX=$(echo "$row" | jq -r '.index')
+            KEY="${HLS_PREFIX}/subs_${IDX}.vtt"
+            FINAL_SUBTITLE_TRACKS=$(echo "$FINAL_SUBTITLE_TRACKS" | jq --argjson r "$row" --arg key "$KEY" \
+              '. + [$r + {key: $key}]')
+          done
+
           jq -n \
             --arg manifestKey "${HLS_PREFIX}/master.m3u8" \
             --argjson renditions "$FINAL_RENDITIONS" \
             --argjson audioTracks "$AUDIO_TRACKS" \
+            --argjson subtitleTracks "$FINAL_SUBTITLE_TRACKS" \
             --argjson totalOutputBytes "${{ steps.upload.outputs.total_bytes }}" \
-            '{status: "completed", manifestKey: $manifestKey, renditions: $renditions, audioTracks: $audioTracks, totalOutputBytes: $totalOutputBytes}' \
+            '{status: "completed", manifestKey: $manifestKey, renditions: $renditions, audioTracks: $audioTracks, subtitleTracks: $subtitleTracks, totalOutputBytes: $totalOutputBytes}' \
             > callback_payload.json
 
           cat callback_payload.json
